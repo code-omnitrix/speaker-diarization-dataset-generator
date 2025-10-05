@@ -1,0 +1,17 @@
+,AudioFileName,Speaker,StartTS,EndTS,Language
+0,diarization_sample_0517.wav,Speaker_02,0.000,18.246,hi
+1,diarization_sample_0517.wav,Speaker_01,19.573,23.066,en
+2,diarization_sample_0517.wav,Speaker_02,24.401,42.647,hi
+3,diarization_sample_0517.wav,Speaker_00,43.633,49.503,en
+4,diarization_sample_0517.wav,Speaker_00,50.052,58.374,en
+5,diarization_sample_0517.wav,Speaker_01,59.058,63.141,en
+6,diarization_sample_0517.wav,Speaker_02,63.541,88.195,hi
+7,diarization_sample_0517.wav,Speaker_01,89.188,93.271,en
+8,diarization_sample_0517.wav,Speaker_02,94.523,112.769,hi
+9,diarization_sample_0517.wav,Speaker_02,113.277,137.931,hi
+10,diarization_sample_0517.wav,Speaker_00,139.166,147.287,en
+11,diarization_sample_0517.wav,Speaker_00,148.766,156.888,en
+12,diarization_sample_0517.wav,Speaker_01,156.080,160.163,en
+13,diarization_sample_0517.wav,Speaker_02,160.990,172.031,hi
+14,diarization_sample_0517.wav,Speaker_00,172.959,178.829,en
+15,diarization_sample_0517.wav,Speaker_01,179.605,185.708,en

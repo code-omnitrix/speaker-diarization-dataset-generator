@@ -1,0 +1,105 @@
+# Dataset directories and files
+output_diarization_dataset/
+Datasets/
+*.parquet
+
+# Audio files
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.aac
+*.ogg
+
+# Annotation files (when not needed in repo)
+*.csv
+*.rttm
+*.lab
+*.textgrid
+
+# Large data files
+*.zip
+*.tar.gz
+*.7z
+*.rar
+
+# Model files (if you save trained models)
+*.pth
+*.pt
+*.model
+*.pkl
+*.joblib
+*.h5
+*.ckpt
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+.env/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+dataset_generation.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# HuggingFace cache
+.cache/
+huggingface/
+
+# Authentication tokens (NEVER commit these!)
+token.txt
+.env
+config.ini
+
+# Large output files
+all_samples_combined.*
+
+# Backup files
+*.bak
+*_backup.*
+backup/

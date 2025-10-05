@@ -1,0 +1,6 @@
+,AudioFileName,Speaker,StartTS,EndTS,Language
+0,diarization_sample_0340.wav,Speaker_00,0.000,8.597,en
+1,diarization_sample_0340.wav,Speaker_01,7.283,16.179,pa
+2,diarization_sample_0340.wav,Speaker_00,17.336,21.376,en
+3,diarization_sample_0340.wav,Speaker_01,22.126,29.821,pa
+4,diarization_sample_0340.wav,Speaker_00,30.754,32.156,en
