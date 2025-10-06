@@ -3,3 +3,6 @@ numpy
 soundfile
 scipy
 pyarrow
+librosa
+audiomentations
+torchaudio

@@ -1,0 +1,14 @@
+,AudioFileName,Speaker,StartTS,EndTS,Language
+0,diarization_sample_0384.wav,Speaker_00,0.000,12.321,en
+1,diarization_sample_0384.wav,Speaker_02,13.634,15.093,hi
+2,diarization_sample_0384.wav,Speaker_03,13.941,18.039,pa
+3,diarization_sample_0384.wav,Speaker_02,18.388,19.453,hi
+4,diarization_sample_0384.wav,Speaker_02,20.652,21.717,hi
+5,diarization_sample_0384.wav,Speaker_03,23.147,27.245,pa
+6,diarization_sample_0384.wav,Speaker_01,28.559,32.817,hi
+7,diarization_sample_0384.wav,Speaker_01,33.994,38.252,hi
+8,diarization_sample_0384.wav,Speaker_02,39.673,40.738,hi
+9,diarization_sample_0384.wav,Speaker_01,41.949,46.207,hi
+10,diarization_sample_0384.wav,Speaker_01,47.446,51.704,hi
+11,diarization_sample_0384.wav,Speaker_02,52.897,53.962,hi
+12,diarization_sample_0384.wav,Speaker_02,54.600,58.100,hi

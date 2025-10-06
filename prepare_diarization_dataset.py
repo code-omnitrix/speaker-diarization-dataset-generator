@@ -1,12 +1,17 @@
 """
-Speaker Diarization Dataset Preparation Script
+Enhanced Speaker Diarization Dataset Preparation Script
 
-This script prepares a dataset for fine-tuning speaker diarization models by:
-1. Loading audio clips from parquet files
-2. Randomly selecting speakers
-3. Combining their audio clips with realistic gaps and limited overlaps
-4. Generating both RTTM and CSV files with speaker diarization timestamps
-5. Focusing on speaker embeddings with consistent speaker characteristics
+This script prepares a multilingual synthetic fine-tuning dataset for PyAnnote speaker diarization model
+with specific focus on minimizing Diarization Error Rate (DER) on Indian languages and noisy environments.
+
+Features implemented according to dataset composition chart:
+1. Audio Duration Categories: Short (30%), Medium (50%), Long (20%)
+2. Speaker Count Distribution: 1 speaker (10%), 2-3 speakers (50%), 4+ speakers (40%)
+3. Noise Level Categories: Clean (20%), Low (30%), Medium (30%), High (20%) with SNR levels
+4. Language Composition: Hindi (15%), Punjabi (15%), English (10%), Bilingual (30%), Trilingual (30%)
+5. Addresses speaker audio chunk bias by ensuring diverse clip usage
+6. Implements speaker overlaps (10-20% in multi-speaker files)
+7. Supports code-switching and language mixing within single files
 """
 
 import pandas as pd
@@ -16,39 +21,170 @@ import random
 from pathlib import Path
 import io
 import soundfile as sf
+import logging
+from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
+from enum import Enum
+import argparse
 
-# Configuration
-NUM_SAMPLES_TO_GENERATE = 10  # Number of audio files to create
-MIN_SPEAKERS = 2  # Minimum speakers per audio (at least 2 for diarization)
-MAX_SPEAKERS = 5  # Maximum speakers per audio
-CLIPS_PER_SPEAKER = 8  # Number of clips to use per speaker
-TARGET_AUDIO_LENGTH = 80  # Target length in seconds
-SILENCE_DURATION_RANGE = (0.3, 1.5)  # Min and max silence duration in seconds
-OVERLAP_PROBABILITY = 0.15  # 15% chance of overlapping speech
-OVERLAP_DURATION_RANGE = (0.5, 2.0)  # Duration of overlap in seconds
-OUTPUT_DIR = "output_diarization_dataset"
-SAMPLE_RATE = 16000  # Standard sample rate for audio
+# Try to import audio processing libraries
+try:
+    import librosa
+    LIBROSA_AVAILABLE = True
+except ImportError:
+    print("Warning: librosa not available. Using basic audio processing.")
+    LIBROSA_AVAILABLE = False
 
-def load_all_datasets(dataset_folder):
-    """Load all parquet files from the Datasets folder (handles any language structure)
+try:
+    from audiomentations import Compose, AddGaussianNoise, AddBackgroundNoise
+    AUDIOMENTATIONS_AVAILABLE = True
+except ImportError:
+    print("Warning: audiomentations not available. Using basic noise addition.")
+    AUDIOMENTATIONS_AVAILABLE = False
+
+# Configuration Classes
+class DurationCategory(Enum):
+    SHORT = "short"    # 10-60 seconds
+    MEDIUM = "medium"  # 1-5 minutes
+    LONG = "long"      # 5+ minutes
+
+class NoiseLevel(Enum):
+    CLEAN = "clean"        # No noise
+    LOW = "low"           # SNR 15-20 dB
+    MEDIUM = "medium"     # SNR 5-15 dB  
+    HIGH = "high"         # SNR 0-5 dB
+
+class LanguageComposition(Enum):
+    HINDI_ONLY = "hindi_only"
+    PUNJABI_ONLY = "punjabi_only"
+    ENGLISH_ONLY = "english_only"
+    BILINGUAL = "bilingual"
+    TRILINGUAL = "trilingual"
+
+@dataclass
+class DatasetConfiguration:
+    """Dataset generation configuration based on composition chart"""
     
-    Supports folder structures like:
-    - Datasets/language1/*.parquet
-    - Datasets/language2/*.parquet
-    - Any number of languages and parquet files
-    """
-    print("Loading datasets...")
+    # Duration distribution (percentages)
+    duration_splits = {
+        DurationCategory.SHORT: 30,   # 30%: 10-60 seconds
+        DurationCategory.MEDIUM: 50,  # 50%: 1-5 minutes  
+        DurationCategory.LONG: 20     # 20%: 5+ minutes
+    }
+    
+    # Duration ranges (seconds)
+    duration_ranges = {
+        DurationCategory.SHORT: (10, 60),
+        DurationCategory.MEDIUM: (60, 300),  # 1-5 minutes
+        DurationCategory.LONG: (300, 600)   # 5-10 minutes
+    }
+    
+    # Speaker count distribution (percentages)
+    speaker_splits = {
+        1: 10,    # 10%: monologue
+        2: 25,    # 25%: dialogue (part of 2-3 speakers = 50%)
+        3: 25,    # 25%: trialogue (part of 2-3 speakers = 50%)
+        4: 20,    # 20%: 4 speakers (part of 4+ speakers = 40%)
+        5: 20     # 20%: 5 speakers (part of 4+ speakers = 40%)
+    }
+    
+    # Noise level distribution (percentages)
+    noise_splits = {
+        NoiseLevel.CLEAN: 20,   # 20%: no noise
+        NoiseLevel.LOW: 30,     # 30%: SNR 15-20 dB
+        NoiseLevel.MEDIUM: 30,  # 30%: SNR 5-15 dB
+        NoiseLevel.HIGH: 20     # 20%: SNR 0-5 dB
+    }
+    
+    # SNR ranges for noise levels (dB)
+    snr_ranges = {
+        NoiseLevel.LOW: (15, 20),
+        NoiseLevel.MEDIUM: (5, 15),
+        NoiseLevel.HIGH: (0, 5)
+    }
+    
+    # Language composition distribution (percentages)
+    language_splits = {
+        LanguageComposition.HINDI_ONLY: 15,      # 15%
+        LanguageComposition.PUNJABI_ONLY: 15,    # 15% 
+        LanguageComposition.ENGLISH_ONLY: 10,    # 10%
+        LanguageComposition.BILINGUAL: 30,       # 30%
+        LanguageComposition.TRILINGUAL: 30       # 30%
+    }
+    
+    # Overlap configuration
+    overlap_probability = 0.15  # 15% chance of overlaps in multi-speaker files
+    overlap_duration_range = (0.5, 2.0)  # 0.5-2.0 seconds
+    
+    # Audio parameters
+    sample_rate = 16000
+    silence_duration_range = (0.3, 1.5)
+
+class SpeakerClipManager:
+    """Manages speaker audio clips to prevent bias from repeating same clips"""
+    
+    def __init__(self, df: pd.DataFrame):
+        self.df = df
+        self.speaker_clips = {}
+        self.used_clips = {}  # Track used clips per speaker
+        self._initialize_speaker_clips()
+    
+    def _initialize_speaker_clips(self):
+        """Initialize clips for each speaker"""
+        for speaker_id in self.df['speaker_id'].unique():
+            speaker_df = self.df[self.df['speaker_id'] == speaker_id]
+            self.speaker_clips[speaker_id] = speaker_df.index.tolist()
+            self.used_clips[speaker_id] = set()
+    
+    def get_fresh_clip(self, speaker_id: str, language_filter: Optional[str] = None) -> Optional[pd.Series]:
+        """Get a fresh (unused) clip for a speaker, optionally filtered by language"""
+        available_clips = [idx for idx in self.speaker_clips[speaker_id] 
+                          if idx not in self.used_clips[speaker_id]]
+        
+        if language_filter:
+            # Filter by language
+            available_clips = [idx for idx in available_clips 
+                             if self.df.loc[idx, 'lang'] == language_filter]
+        
+        if not available_clips:
+            # Reset used clips if we've exhausted all clips for this speaker
+            self.used_clips[speaker_id] = set()
+            available_clips = [idx for idx in self.speaker_clips[speaker_id]]
+            
+            if language_filter:
+                available_clips = [idx for idx in available_clips 
+                                 if self.df.loc[idx, 'lang'] == language_filter]
+        
+        if not available_clips:
+            return None
+            
+        # Select random fresh clip
+        selected_idx = random.choice(available_clips)
+        self.used_clips[speaker_id].add(selected_idx)
+        
+        return self.df.loc[selected_idx]
+
+def setup_logging():
+    """Setup logging configuration"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('dataset_generation.log'),
+            logging.StreamHandler()
+        ]
+    )
+
+def load_multilingual_datasets(dataset_folder: str) -> pd.DataFrame:
+    """Load all parquet files from the Datasets folder with language detection"""
+    logging.info("Loading multilingual datasets...")
     all_data = []
     
     dataset_path = Path(dataset_folder)
-    
-    # Check if dataset folder exists
     if not dataset_path.exists():
         raise FileNotFoundError(f"Dataset folder not found: {dataset_folder}")
     
-    # Recursively find all parquet files
     parquet_files = list(dataset_path.rglob("*.parquet"))
-    
     if not parquet_files:
         raise FileNotFoundError(f"No parquet files found in {dataset_folder}")
     
@@ -56,7 +192,7 @@ def load_all_datasets(dataset_folder):
     language_stats = {}
     
     for parquet_file in parquet_files:
-        print(f"Loading {parquet_file}...")
+        logging.info(f"Loading {parquet_file}...")
         df = pd.read_parquet(parquet_file)
         all_data.append(df)
         
@@ -68,209 +204,330 @@ def load_all_datasets(dataset_folder):
     
     combined_df = pd.concat(all_data, ignore_index=True)
     
-    print(f"\n📊 Dataset Statistics:")
-    print(f"  Total parquet files: {len(parquet_files)}")
-    print(f"  Total records loaded: {len(combined_df)}")
-    print(f"  Languages/folders detected: {list(language_stats.keys())}")
-    for lang, count in language_stats.items():
-        print(f"    - {lang}: {count} records")
-    
-    # Check if required columns exist
+    # Validate required columns
     required_columns = ['audio_filepath', 'speaker_id', 'lang']
     missing_columns = [col for col in required_columns if col not in combined_df.columns]
     if missing_columns:
         raise ValueError(f"Missing required columns: {missing_columns}")
     
-    print(f"  Unique speakers: {combined_df['speaker_id'].nunique()}")
-    print(f"  Languages in data: {combined_df['lang'].unique().tolist()}\n")
+    # Clean up language data
+    # Replace NaN values with parent folder names for language inference
+    for idx, row in combined_df.iterrows():
+        if pd.isna(row['lang']) or str(row['lang']).lower() == 'nan':
+            # Try to infer language from folder structure
+            for parquet_file in parquet_files:
+                try:
+                    # This is a simple heuristic - you might need to adjust based on your data structure
+                    parent_folder = parquet_file.parent.name
+                    if parent_folder in ['hindi', 'punjabi', 'english']:
+                        combined_df.loc[idx, 'lang'] = parent_folder
+                        break
+                except:
+                    pass
+    
+    # Filter out rows with invalid languages
+    before_filter = len(combined_df)
+    combined_df = combined_df[pd.notna(combined_df['lang']) & (combined_df['lang'].astype(str) != 'nan')]
+    after_filter = len(combined_df)
+    
+    if before_filter != after_filter:
+        logging.warning(f"Filtered out {before_filter - after_filter} records with invalid language data")
+    
+    # Log statistics
+    logging.info(f"Dataset Statistics:")
+    logging.info(f"  Total parquet files: {len(parquet_files)}")
+    logging.info(f"  Total records loaded: {len(combined_df)}")
+    logging.info(f"  Languages/folders: {list(language_stats.keys())}")
+    for lang, count in language_stats.items():
+        logging.info(f"    - {lang}: {count} records")
+    
+    logging.info(f"  Unique speakers: {combined_df['speaker_id'].nunique()}")
+    logging.info(f"  Languages in data: {combined_df['lang'].unique().tolist()}")
     
     return combined_df
 
-def extract_audio_from_bytes(audio_bytes):
+def extract_audio_from_bytes(audio_bytes) -> Tuple[Optional[np.ndarray], Optional[int]]:
     """Extract audio data from byte format"""
     try:
         audio_data, sr = sf.read(io.BytesIO(audio_bytes['bytes']))
         return audio_data, sr
     except Exception as e:
-        print(f"Error extracting audio: {e}")
+        logging.error(f"Error extracting audio: {e}")
         return None, None
 
-def generate_silence(duration, sample_rate):
-    """Generate silence (near-zero values) for the specified duration"""
+def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    """Resample audio to target sample rate"""
+    if orig_sr == target_sr:
+        return audio
+    
+    if LIBROSA_AVAILABLE:
+        return librosa.resample(audio, orig_sr=orig_sr, target_sr=target_sr)
+    else:
+        # Fallback to scipy
+        from scipy import signal
+        num_samples = int(len(audio) * target_sr / orig_sr)
+        return signal.resample(audio, num_samples)
+
+def generate_silence(duration: float, sample_rate: int) -> np.ndarray:
+    """Generate silence with minimal background noise"""
     num_samples = int(duration * sample_rate)
     # Very low amplitude background noise to simulate silence
     silence = np.random.normal(0, 0.001, num_samples)
     return silence
 
-def mix_audio_with_overlap(audio1, audio2, overlap_duration, sample_rate):
-    """Mix two audio clips with specified overlap duration"""
-    overlap_samples = int(overlap_duration * sample_rate)
+def add_noise_to_audio(audio: np.ndarray, noise_level: NoiseLevel, config: DatasetConfiguration,
+                      noise_dir: Optional[str] = None) -> np.ndarray:
+    """Add noise to audio based on specified noise level and SNR"""
+    if noise_level == NoiseLevel.CLEAN:
+        return audio
     
-    if len(audio1) < overlap_samples or len(audio2) < overlap_samples:
-        overlap_samples = min(len(audio1), len(audio2))
+    # Get SNR range for this noise level
+    snr_range = config.snr_ranges[noise_level]
+    target_snr = random.uniform(snr_range[0], snr_range[1])
     
-    # Take the end of audio1 and beginning of audio2 for overlap
-    audio1_overlap = audio1[-overlap_samples:]
-    audio2_overlap = audio2[:overlap_samples]
+    if AUDIOMENTATIONS_AVAILABLE and noise_dir and os.path.exists(noise_dir):
+        # Use audiomentations with actual noise files
+        try:
+            augmentation = Compose([
+                AddBackgroundNoise(
+                    sounds_path=noise_dir,
+                    min_snr_in_db=target_snr,
+                    max_snr_in_db=target_snr + 2,
+                    p=1.0
+                )
+            ])
+            return augmentation(samples=audio, sample_rate=config.sample_rate)
+        except Exception as e:
+            logging.warning(f"Failed to add background noise: {e}. Using Gaussian noise.")
     
-    # Mix the overlapping portions (simple addition with normalization)
-    mixed_overlap = (audio1_overlap + audio2_overlap) * 0.6
+    # Fallback: Add Gaussian noise to achieve target SNR
+    signal_power = np.mean(audio ** 2)
+    signal_power_db = 10 * np.log10(signal_power + 1e-10)
+    noise_power_db = signal_power_db - target_snr
+    noise_power = 10 ** (noise_power_db / 10)
     
-    # Combine: audio1 (except overlap) + mixed + audio2 (except overlap)
-    result = np.concatenate([
-        audio1[:-overlap_samples],
-        mixed_overlap,
-        audio2[overlap_samples:]
-    ])
+    noise = np.random.normal(0, np.sqrt(noise_power), len(audio))
     
-    return result, overlap_samples / sample_rate
+    # Different noise types based on level
+    if noise_level == NoiseLevel.LOW:
+        # Mild background hum
+        noise = noise * 0.5
+    elif noise_level == NoiseLevel.MEDIUM:
+        # Mix of noise types
+        noise = noise + np.random.normal(0, np.sqrt(noise_power) * 0.3, len(audio))
+    elif noise_level == NoiseLevel.HIGH:
+        # More aggressive noise
+        noise = noise + np.random.normal(0, np.sqrt(noise_power) * 0.5, len(audio))
+    
+    return audio + noise
 
-def create_diarization_audio(df, num_speakers, clips_per_speaker, target_length, sample_rate):
-    """Create a single audio file with multiple speakers and return diarization info
+def select_duration_category(config: DatasetConfiguration) -> DurationCategory:
+    """Select duration category based on configured splits"""
+    rand = random.random() * 100
+    cumulative = 0
     
-    This includes:
-    - Realistic silence between speakers
-    - Limited overlapping speech segments
-    - Consistent speaker characteristics throughout
-    """
+    for category, percentage in config.duration_splits.items():
+        cumulative += percentage
+        if rand <= cumulative:
+            return category
     
-    # Select random speakers
-    unique_speakers = df['speaker_id'].unique()
-    if len(unique_speakers) < num_speakers:
-        num_speakers = len(unique_speakers)
+    return DurationCategory.MEDIUM  # fallback
+
+def select_speaker_count(config: DatasetConfiguration) -> int:
+    """Select number of speakers based on configured splits"""
+    rand = random.random() * 100
+    cumulative = 0
     
-    selected_speakers = random.sample(list(unique_speakers), num_speakers)
-    print(f"Selected {num_speakers} speakers: {selected_speakers}")
+    for count, percentage in config.speaker_splits.items():
+        cumulative += percentage
+        if rand <= cumulative:
+            return count
     
-    # Collect audio clips for each speaker
-    audio_clips_by_speaker = {}
+    return 2  # fallback
+
+def select_noise_level(config: DatasetConfiguration) -> NoiseLevel:
+    """Select noise level based on configured splits"""
+    rand = random.random() * 100
+    cumulative = 0
     
-    for speaker in selected_speakers:
-        speaker_df = df[df['speaker_id'] == speaker]
-        # Take random clips from this speaker
-        num_clips = min(clips_per_speaker, len(speaker_df))
-        selected_clips = speaker_df.sample(n=num_clips)
+    for level, percentage in config.noise_splits.items():
+        cumulative += percentage
+        if rand <= cumulative:
+            return level
+    
+    return NoiseLevel.LOW  # fallback
+
+def select_language_composition(config: DatasetConfiguration) -> LanguageComposition:
+    """Select language composition based on configured splits"""
+    rand = random.random() * 100
+    cumulative = 0
+    
+    for composition, percentage in config.language_splits.items():
+        cumulative += percentage
+        if rand <= cumulative:
+            return composition
+    
+    return LanguageComposition.BILINGUAL  # fallback
+
+def get_target_duration(duration_category: DurationCategory, config: DatasetConfiguration) -> float:
+    """Get target duration for the selected category"""
+    min_dur, max_dur = config.duration_ranges[duration_category]
+    return random.uniform(min_dur, max_dur)
+
+def get_languages_for_composition(composition: LanguageComposition, available_langs: List[str]) -> List[str]:
+    """Get list of languages for the specified composition"""
+    # Normalize available languages and filter out NaN/None values
+    available_langs = [str(lang).lower() for lang in available_langs if pd.notna(lang) and str(lang) != 'nan']
+    
+    if composition == LanguageComposition.HINDI_ONLY:
+        return ['hindi', 'hi'] if any(lang in ['hindi', 'hi'] for lang in available_langs) else [available_langs[0]]
+    elif composition == LanguageComposition.PUNJABI_ONLY:
+        return ['punjabi', 'pa'] if any(lang in ['punjabi', 'pa'] for lang in available_langs) else [available_langs[0]]
+    elif composition == LanguageComposition.ENGLISH_ONLY:
+        return ['english', 'en'] if any(lang in ['english', 'en'] for lang in available_langs) else [available_langs[0]]
+    elif composition == LanguageComposition.BILINGUAL:
+        # Mix of 2 languages - prefer Hindi-English or Punjabi-English
+        if 'hindi' in available_langs or 'hi' in available_langs:
+            hindi = 'hindi' if 'hindi' in available_langs else 'hi'
+            if 'english' in available_langs or 'en' in available_langs:
+                english = 'english' if 'english' in available_langs else 'en'
+                return [hindi, english]
+        elif 'punjabi' in available_langs or 'pa' in available_langs:
+            punjabi = 'punjabi' if 'punjabi' in available_langs else 'pa'
+            if 'english' in available_langs or 'en' in available_langs:
+                english = 'english' if 'english' in available_langs else 'en'
+                return [punjabi, english]
+        # Fallback to any 2 languages
+        return available_langs[:2] if len(available_langs) >= 2 else available_langs
+    elif composition == LanguageComposition.TRILINGUAL:
+        # Mix of 3 languages - Hindi, Punjabi, English if available
+        target_langs = []
+        for lang_set in [['hindi', 'hi'], ['punjabi', 'pa'], ['english', 'en']]:
+            for lang in lang_set:
+                if lang in available_langs:
+                    target_langs.append(lang)
+                    break
         
-        clips = []
-        for idx, row in selected_clips.iterrows():
-            audio_data, sr = extract_audio_from_bytes(row['audio_filepath'])
-            if audio_data is not None:
-                # Resample if needed
-                if sr != sample_rate:
-                    from scipy import signal
-                    num_samples = int(len(audio_data) * sample_rate / sr)
-                    audio_data = signal.resample(audio_data, num_samples)
-                
-                clips.append({
-                    'audio': audio_data,
-                    'speaker': speaker,
-                    'language': row['lang'],
-                    'duration': len(audio_data) / sample_rate
-                })
+        # Fill up to 3 languages
+        while len(target_langs) < 3 and len(target_langs) < len(available_langs):
+            for lang in available_langs:
+                if lang not in target_langs:
+                    target_langs.append(lang)
+                    break
         
-        audio_clips_by_speaker[speaker] = clips
+        return target_langs[:3] if target_langs else available_langs
     
-    # Build the final audio file with timing information
-    audio_segments = []  # List of (audio_array, start_time, end_time, speaker, language)
+    return available_langs
+
+def create_mixed_language_audio(clip_manager: SpeakerClipManager, speakers: List[str], 
+                              target_languages: List[str], target_duration: float,
+                              config: DatasetConfiguration) -> Tuple[np.ndarray, List[Dict], List[str]]:
+    """Create audio with mixed languages (code-switching)"""
+    
+    audio_segments = []
     diarization_records = []
     current_time = 0.0
     previous_speaker = None
     
-    while current_time < target_length:
-        # Randomly select a speaker (prefer different from previous)
-        available_speakers = [s for s in selected_speakers if s != previous_speaker]
+    # Calculate total clips needed based on target duration
+    avg_clip_duration = 3.0  # Assume average clip is 3 seconds
+    total_clips_needed = int(target_duration / avg_clip_duration * 1.2)  # Add buffer
+    
+    clips_generated = 0
+    
+    while current_time < target_duration and clips_generated < total_clips_needed:
+        # Select speaker (prefer different from previous)
+        available_speakers = [s for s in speakers if s != previous_speaker]
         if not available_speakers:
-            available_speakers = selected_speakers
+            available_speakers = speakers
         speaker = random.choice(available_speakers)
         
-        # Check if this speaker has clips available
-        if not audio_clips_by_speaker[speaker]:
-            break
+        # Select language for this segment (supports code-switching)
+        target_lang = random.choice(target_languages)
         
-        # Randomly select a clip from this speaker
-        clip_info = random.choice(audio_clips_by_speaker[speaker])
-        audio_clip = clip_info['audio']
-        clip_duration = clip_info['duration']
+        # Get a fresh clip for this speaker in target language
+        clip_row = clip_manager.get_fresh_clip(speaker, target_lang)
+        if clip_row is None:
+            # Try any language if specific language not available
+            clip_row = clip_manager.get_fresh_clip(speaker)
+            if clip_row is None:
+                break
+        
+        # Extract and process audio
+        audio_data, sr = extract_audio_from_bytes(clip_row['audio_filepath'])
+        if audio_data is None:
+            continue
+            
+        # Resample if needed
+        if sr != config.sample_rate:
+            audio_data = resample_audio(audio_data, sr, config.sample_rate)
+        
+        clip_duration = len(audio_data) / config.sample_rate
         
         # Decide if this clip should overlap with previous
         should_overlap = (
             len(audio_segments) > 0 and 
-            random.random() < OVERLAP_PROBABILITY and
-            previous_speaker != speaker
+            random.random() < config.overlap_probability and
+            previous_speaker != speaker and
+            len(speakers) > 1  # Only overlap in multi-speaker scenarios
         )
         
         if should_overlap:
             # Create overlapping speech
-            overlap_duration = random.uniform(*OVERLAP_DURATION_RANGE)
+            overlap_duration = random.uniform(*config.overlap_duration_range)
             overlap_duration = min(overlap_duration, clip_duration * 0.5)  # Max 50% overlap
             
-            # Adjust start time to create overlap
             start_time = current_time - overlap_duration
             end_time = start_time + clip_duration
-            
-            audio_segments.append({
-                'audio': audio_clip,
-                'start': start_time,
-                'end': end_time,
-                'speaker': speaker,
-                'language': clip_info['language']
-            })
-            
-            current_time = end_time
-            
         else:
             # Normal sequential speech with silence gap
             if len(audio_segments) > 0:
-                # Add silence between speakers
-                silence_duration = random.uniform(*SILENCE_DURATION_RANGE)
+                silence_duration = random.uniform(*config.silence_duration_range)
                 current_time += silence_duration
             
             start_time = current_time
             end_time = current_time + clip_duration
-            
-            audio_segments.append({
-                'audio': audio_clip,
-                'start': start_time,
-                'end': end_time,
-                'speaker': speaker,
-                'language': clip_info['language']
-            })
-            
-            current_time = end_time
         
+        # Add segment
+        audio_segments.append({
+            'audio': audio_data,
+            'start': start_time,
+            'end': end_time,
+            'speaker': speaker,
+            'language': clip_row['lang']
+        })
+        
+        current_time = end_time
         previous_speaker = speaker
+        clips_generated += 1
     
-    # Build final audio array by mixing overlapping segments
+    # Build final audio by mixing overlapping segments
     if not audio_segments:
-        return np.array([]), [], selected_speakers
+        return np.array([]), [], speakers
     
     total_duration = max(seg['end'] for seg in audio_segments)
-    total_samples = int(total_duration * sample_rate)
+    total_samples = int(total_duration * config.sample_rate)
     final_audio = np.zeros(total_samples)
     
-    # Mix all audio segments at their respective positions
+    # Mix all segments at their positions
     for seg in audio_segments:
-        start_sample = int(seg['start'] * sample_rate)
+        start_sample = int(seg['start'] * config.sample_rate)
         audio_data = seg['audio']
         end_sample = start_sample + len(audio_data)
         
-        # Skip segments that start beyond the final audio length
+        # Handle bounds
         if start_sample >= len(final_audio):
             continue
-        
-        # Ensure we don't exceed array bounds
         if end_sample > len(final_audio):
             audio_data = audio_data[:len(final_audio) - start_sample]
             end_sample = len(final_audio)
-        
-        # Skip if no audio data remains after trimming
         if len(audio_data) == 0:
             continue
         
-        # Add audio (overlaps will naturally mix)
+        # Mix audio (overlaps will naturally blend)
         final_audio[start_sample:end_sample] += audio_data * 0.7
         
-        # Record diarization info (only for segments that made it into the audio)
+        # Record diarization info
         diarization_records.append({
             'Speaker': seg['speaker'],
             'StartTS': seg['start'],
@@ -286,77 +543,26 @@ def create_diarization_audio(df, num_speakers, clips_per_speaker, target_length,
     # Sort diarization records by start time
     diarization_records.sort(key=lambda x: x['StartTS'])
     
-    return final_audio, diarization_records, selected_speakers
+    return final_audio, diarization_records, speakers
 
-def count_overlaps(diarization_records):
-    """Count the number of overlapping speech segments"""
-    overlaps = 0
-    for i, record1 in enumerate(diarization_records):
-        for record2 in diarization_records[i+1:]:
-            # Check if segments overlap
-            start1, end1 = record1['StartTS'], record1['EndTS']
-            start2, end2 = record2['StartTS'], record2['EndTS']
-            
-            if start1 < end2 and start2 < end1 and record1['Speaker'] != record2['Speaker']:
-                overlaps += 1
-    return overlaps
-
-def save_rttm_file(diarization_records, filename, rttm_dir):
-    """Save RTTM (Rich Transcription Time Marked) file for pyannote
+def save_audio_and_annotations(audio_data: np.ndarray, diarization_records: List[Dict], 
+                              filename: str, output_dir: str, config: DatasetConfiguration) -> Tuple[str, str, str]:
+    """Save audio file and generate both CSV and RTTM annotations"""
     
-    RTTM format: SPEAKER <file-id> <channel> <start-time> <duration> <NA> <NA> <speaker-id> <NA> <NA>
-    """
-    os.makedirs(rttm_dir, exist_ok=True)
-    rttm_filename = f"{filename}.rttm"
-    rttm_path = os.path.join(rttm_dir, rttm_filename)
+    # Create directory structure
+    audio_dir = Path(output_dir) / "audio"
+    csv_dir = Path(output_dir) / "csv" 
+    rttm_dir = Path(output_dir) / "rttm"
     
-    with open(rttm_path, 'w') as f:
-        for record in diarization_records:
-            start = record['StartTS']
-            end = record['EndTS']
-            duration = end - start
-            speaker = record['Speaker']
-            
-            # RTTM format line
-            f.write(f"SPEAKER {filename} 1 {start:.3f} {duration:.3f} <NA> <NA> {speaker} <NA> <NA>\n")
+    for dir_path in [audio_dir, csv_dir, rttm_dir]:
+        dir_path.mkdir(parents=True, exist_ok=True)
     
-    print(f"Saved RTTM: {rttm_path}")
-    return rttm_path
-
-def append_to_combined_rttm(diarization_records, filename, combined_rttm_path):
-    """Append diarization records to a combined RTTM file
-    
-    This creates a single RTTM file with all samples - standard format for pyannote training
-    """
-    with open(combined_rttm_path, 'a') as f:
-        for record in diarization_records:
-            start = record['StartTS']
-            end = record['EndTS']
-            duration = end - start
-            speaker = record['Speaker']
-            
-            # RTTM format line
-            f.write(f"SPEAKER {filename} 1 {start:.3f} {duration:.3f} <NA> <NA> {speaker} <NA> <NA>\n")
-
-def save_audio_csv_and_rttm(audio_data, diarization_records, filename, output_dir, sample_rate):
-    """Save the audio file, CSV, and RTTM files in organized folder structure"""
-    
-    # Create organized directory structure
-    audio_dir = os.path.join(output_dir, "audio")
-    rttm_dir = os.path.join(output_dir, "rttm")
-    csv_dir = os.path.join(output_dir, "csv")
-    
-    os.makedirs(audio_dir, exist_ok=True)
-    os.makedirs(rttm_dir, exist_ok=True)
-    os.makedirs(csv_dir, exist_ok=True)
-    
-    # Save audio file in audio folder
+    # Save audio file
     audio_filename = f"{filename}.wav"
-    audio_path = os.path.join(audio_dir, audio_filename)
-    sf.write(audio_path, audio_data, sample_rate)
-    print(f"Saved audio: {audio_path}")
+    audio_path = audio_dir / audio_filename
+    sf.write(str(audio_path), audio_data, config.sample_rate)
     
-    # Prepare CSV data (in the specified format)
+    # Save CSV file
     csv_data = []
     for idx, record in enumerate(diarization_records, start=1):
         csv_data.append({
@@ -367,120 +573,272 @@ def save_audio_csv_and_rttm(audio_data, diarization_records, filename, output_di
             'Language': record['Language']
         })
     
-    # Save CSV file in csv folder
-    csv_filename = f"{filename}.csv"
-    csv_path = os.path.join(csv_dir, csv_filename)
+    csv_path = csv_dir / f"{filename}.csv"
     df_csv = pd.DataFrame(csv_data)
-    df_csv.to_csv(csv_path, index=True, index_label='')
-    print(f"Saved CSV: {csv_path}")
+    df_csv.to_csv(str(csv_path), index=True, index_label='')
     
-    # Save RTTM file in rttm folder
-    rttm_path = save_rttm_file(diarization_records, filename, rttm_dir)
+    # Save RTTM file
+    rttm_path = rttm_dir / f"{filename}.rttm"
+    with open(str(rttm_path), 'w') as f:
+        for record in diarization_records:
+            start = record['StartTS']
+            end = record['EndTS']
+            duration = end - start
+            speaker = record['Speaker']
+            f.write(f"SPEAKER {filename} 1 {start:.3f} {duration:.3f} <NA> <NA> {speaker} <NA> <NA>\n")
     
-    return audio_path, csv_path, rttm_path
+    logging.info(f"Saved: {audio_path}, {csv_path}, {rttm_path}")
+    return str(audio_path), str(csv_path), str(rttm_path)
+
+def append_to_combined_files(diarization_records: List[Dict], filename: str, output_dir: str):
+    """Append to combined CSV and RTTM files"""
+    
+    # Combined CSV
+    combined_csv_path = Path(output_dir) / "all_samples_combined.csv"
+    audio_filename = f"{filename}.wav"
+    
+    csv_data = []
+    for record in diarization_records:
+        csv_data.append({
+            'AudioFileName': audio_filename,
+            'Speaker': record['Speaker'],
+            'StartTS': f"{record['StartTS']:.3f}",
+            'EndTS': f"{record['EndTS']:.3f}",
+            'Language': record['Language']
+        })
+    
+    df_new = pd.DataFrame(csv_data)
+    
+    # Append or create CSV
+    if combined_csv_path.exists():
+        df_existing = pd.read_csv(str(combined_csv_path), index_col=0)
+        df_combined = pd.concat([df_existing, df_new], ignore_index=True)
+        df_combined.to_csv(str(combined_csv_path), index=True, index_label='')
+    else:
+        df_new.to_csv(str(combined_csv_path), index=True, index_label='')
+    
+    # Combined RTTM
+    combined_rttm_path = Path(output_dir) / "all_samples_combined.rttm"
+    with open(str(combined_rttm_path), 'a') as f:
+        for record in diarization_records:
+            start = record['StartTS']
+            end = record['EndTS']
+            duration = end - start
+            speaker = record['Speaker']
+            f.write(f"SPEAKER {filename} 1 {start:.3f} {duration:.3f} <NA> <NA> {speaker} <NA> <NA>\n")
+
+def calculate_sample_counts(total_hours: float, config: DatasetConfiguration) -> Dict:
+    """Calculate number of samples needed for each category combination"""
+    
+    # Estimate average duration for each category
+    avg_durations = {
+        DurationCategory.SHORT: (config.duration_ranges[DurationCategory.SHORT][0] + 
+                                config.duration_ranges[DurationCategory.SHORT][1]) / 2,
+        DurationCategory.MEDIUM: (config.duration_ranges[DurationCategory.MEDIUM][0] + 
+                                 config.duration_ranges[DurationCategory.MEDIUM][1]) / 2,
+        DurationCategory.LONG: (config.duration_ranges[DurationCategory.LONG][0] + 
+                               config.duration_ranges[DurationCategory.LONG][1]) / 2
+    }
+    
+    total_seconds = total_hours * 3600
+    
+    # Calculate samples per duration category
+    samples_per_category = {}
+    for category, percentage in config.duration_splits.items():
+        category_seconds = total_seconds * (percentage / 100)
+        avg_duration = avg_durations[category]
+        samples_needed = int(category_seconds / avg_duration)
+        samples_per_category[category] = samples_needed
+    
+    total_samples = sum(samples_per_category.values())
+    
+    logging.info(f"Sample distribution for {total_hours} hours:")
+    for category, count in samples_per_category.items():
+        logging.info(f"  {category.value}: {count} samples")
+    logging.info(f"  Total samples: {total_samples}")
+    
+    return samples_per_category
+
+def generate_dataset(total_hours: float, output_dir: str, source_dirs: Dict[str, str], 
+                    noise_dir: Optional[str] = None):
+    """
+    Main dataset generation function
+    
+    Args:
+        total_hours: Total duration of dataset to generate
+        output_dir: Output directory path
+        source_dirs: Dictionary mapping language names to dataset directories
+        noise_dir: Optional directory containing noise files
+    """
+    
+    setup_logging()
+    config = DatasetConfiguration()
+    
+    # Clear combined files if they exist
+    combined_csv_path = Path(output_dir) / "all_samples_combined.csv"
+    combined_rttm_path = Path(output_dir) / "all_samples_combined.rttm"
+    
+    for path in [combined_csv_path, combined_rttm_path]:
+        if path.exists():
+            path.unlink()
+    
+    # Load datasets
+    all_datasets = []
+    for lang_name, dataset_path in source_dirs.items():
+        try:
+            df = load_multilingual_datasets(dataset_path)
+            all_datasets.append(df)
+            logging.info(f"Loaded {lang_name} dataset: {len(df)} samples")
+        except Exception as e:
+            logging.error(f"Failed to load {lang_name} dataset from {dataset_path}: {e}")
+    
+    if not all_datasets:
+        raise ValueError("No datasets loaded successfully")
+    
+    # Combine all datasets
+    combined_df = pd.concat(all_datasets, ignore_index=True)
+    logging.info(f"Combined dataset: {len(combined_df)} samples, {combined_df['speaker_id'].nunique()} unique speakers")
+    
+    # Initialize clip manager to prevent bias
+    clip_manager = SpeakerClipManager(combined_df)
+    
+    # Calculate samples needed per category
+    samples_per_duration = calculate_sample_counts(total_hours, config)
+    
+    # Track generation statistics
+    stats = {
+        'generated_samples': 0,
+        'duration_categories': {cat: 0 for cat in DurationCategory},
+        'speaker_counts': {count: 0 for count in config.speaker_splits.keys()},
+        'noise_levels': {level: 0 for level in NoiseLevel},
+        'language_compositions': {comp: 0 for comp in LanguageComposition},
+        'total_duration': 0.0,
+        'overlaps_created': 0
+    }
+    
+    sample_counter = 1
+    
+    # Generate samples for each duration category
+    for duration_category, num_samples in samples_per_duration.items():
+        logging.info(f"Generating {num_samples} samples for {duration_category.value} category...")
+        
+        for i in range(num_samples):
+            try:
+                # Select parameters for this sample
+                target_duration = get_target_duration(duration_category, config)
+                speaker_count = select_speaker_count(config)
+                noise_level = select_noise_level(config)
+                language_composition = select_language_composition(config)
+                
+                # Get available languages
+                available_langs = combined_df['lang'].unique().tolist()
+                target_languages = get_languages_for_composition(language_composition, available_langs)
+                
+                # Select speakers
+                all_speakers = combined_df['speaker_id'].unique().tolist()
+                if len(all_speakers) < speaker_count:
+                    speaker_count = len(all_speakers)
+                selected_speakers = random.sample(all_speakers, speaker_count)
+                
+                # Create mixed language audio
+                audio_data, diarization_records, used_speakers = create_mixed_language_audio(
+                    clip_manager, selected_speakers, target_languages, target_duration, config
+                )
+                
+                if len(audio_data) == 0:
+                    logging.warning(f"Failed to generate audio for sample {sample_counter}")
+                    continue
+                
+                # Add noise
+                audio_data = add_noise_to_audio(audio_data, noise_level, config, noise_dir)
+                
+                # Save files
+                filename = f"diarization_sample_{sample_counter:04d}"
+                save_audio_and_annotations(audio_data, diarization_records, filename, output_dir, config)
+                append_to_combined_files(diarization_records, filename, output_dir)
+                
+                # Update statistics
+                actual_duration = len(audio_data) / config.sample_rate
+                overlap_count = sum(1 for i, r1 in enumerate(diarization_records) 
+                                  for r2 in diarization_records[i+1:] 
+                                  if r1['StartTS'] < r2['EndTS'] and r2['StartTS'] < r1['EndTS'] 
+                                  and r1['Speaker'] != r2['Speaker'])
+                
+                stats['generated_samples'] += 1
+                stats['duration_categories'][duration_category] += 1
+                stats['speaker_counts'][len(used_speakers)] += 1
+                stats['noise_levels'][noise_level] += 1
+                stats['language_compositions'][language_composition] += 1
+                stats['total_duration'] += actual_duration
+                stats['overlaps_created'] += overlap_count
+                
+                logging.info(f"Sample {sample_counter}: {duration_category.value}, "
+                           f"{len(used_speakers)} speakers, {noise_level.value} noise, "
+                           f"{language_composition.value}, {actual_duration:.1f}s, {overlap_count} overlaps")
+                
+                sample_counter += 1
+                
+            except Exception as e:
+                logging.error(f"Failed to generate sample {sample_counter}: {e}")
+                continue
+    
+    # Log final statistics
+    logging.info("\n" + "="*50)
+    logging.info("DATASET GENERATION COMPLETE")
+    logging.info("="*50)
+    logging.info(f"Total samples generated: {stats['generated_samples']}")
+    logging.info(f"Total duration: {stats['total_duration']/3600:.2f} hours")
+    logging.info(f"Total overlaps created: {stats['overlaps_created']}")
+    
+    logging.info("\nDuration Category Distribution:")
+    for cat, count in stats['duration_categories'].items():
+        percentage = (count / stats['generated_samples'] * 100) if stats['generated_samples'] > 0 else 0
+        logging.info(f"  {cat.value}: {count} samples ({percentage:.1f}%)")
+    
+    logging.info("\nSpeaker Count Distribution:")
+    for count, num_samples in stats['speaker_counts'].items():
+        percentage = (num_samples / stats['generated_samples'] * 100) if stats['generated_samples'] > 0 else 0
+        logging.info(f"  {count} speakers: {num_samples} samples ({percentage:.1f}%)")
+    
+    logging.info("\nNoise Level Distribution:")
+    for level, count in stats['noise_levels'].items():
+        percentage = (count / stats['generated_samples'] * 100) if stats['generated_samples'] > 0 else 0
+        logging.info(f"  {level.value}: {count} samples ({percentage:.1f}%)")
+    
+    logging.info("\nLanguage Composition Distribution:")
+    for comp, count in stats['language_compositions'].items():
+        percentage = (count / stats['generated_samples'] * 100) if stats['generated_samples'] > 0 else 0
+        logging.info(f"  {comp.value}: {count} samples ({percentage:.1f}%)")
+    
+    logging.info(f"\nOutput saved to: {output_dir}")
 
 def main():
-    """Main function to prepare the diarization dataset"""
+    """Main function with command line argument parsing"""
+    parser = argparse.ArgumentParser(description="Generate multilingual speaker diarization dataset")
     
-    # Set random seed for reproducibility (optional)
-    # random.seed(42)
-    # np.random.seed(42)
+    parser.add_argument('--total_hours', type=float, default=1.0,
+                       help='Total hours of dataset to generate (default: 1.0)')
+    parser.add_argument('--output_dir', type=str, default='output_diarization_dataset',
+                       help='Output directory (default: output_diarization_dataset)')
+    parser.add_argument('--dataset_dir', type=str, default='../Datasets',
+                       help='Path to datasets directory (default: ../Datasets)')
+    parser.add_argument('--noise_dir', type=str, default=None,
+                       help='Path to noise files directory (optional)')
     
-    # Load datasets (works with any language folder structure)
-    dataset_folder = "../Datasets"
-    try:
-        df = load_all_datasets(dataset_folder)
-    except Exception as e:
-        print(f"\n❌ Error loading datasets: {e}")
-        print(f"\nMake sure your Datasets folder has this structure:")
-        print(f"  Datasets/")
-        print(f"    language1/")
-        print(f"      file1.parquet")
-        print(f"      file2.parquet")
-        print(f"    language2/")
-        print(f"      file1.parquet")
-        return
+    args = parser.parse_args()
     
-    print(f"\n🚀 Generating {NUM_SAMPLES_TO_GENERATE} audio samples...")
+    # Setup source directories (modify as needed for your dataset structure)
+    source_dirs = {
+        'multilingual': args.dataset_dir
+    }
     
-    # Create output directory
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    
-    # Store all diarization data for combined files
-    all_diarization_data = []
-    combined_rttm_path = os.path.join(OUTPUT_DIR, "all_samples_combined.rttm")
-    
-    # Clear combined RTTM file if it exists
-    if os.path.exists(combined_rttm_path):
-        os.remove(combined_rttm_path)
-    
-    for i in range(NUM_SAMPLES_TO_GENERATE):
-        print(f"\n--- Generating sample {i+1}/{NUM_SAMPLES_TO_GENERATE} ---")
-        
-        # Random number of speakers for this sample
-        num_speakers = random.randint(MIN_SPEAKERS, MAX_SPEAKERS)
-        
-        # Create diarization audio
-        audio_data, diarization_records, speakers = create_diarization_audio(
-            df, 
-            num_speakers, 
-            CLIPS_PER_SPEAKER, 
-            TARGET_AUDIO_LENGTH, 
-            SAMPLE_RATE
-        )
-        
-        # Save audio, CSV, and RTTM
-        filename = f"diarization_sample_{i+1:03d}"
-        audio_path, csv_path, rttm_path = save_audio_csv_and_rttm(
-            audio_data, 
-            diarization_records, 
-            filename, 
-            OUTPUT_DIR, 
-            SAMPLE_RATE
-        )
-        
-        # Append to combined RTTM file (for pyannote training)
-        append_to_combined_rttm(diarization_records, filename, combined_rttm_path)
-        
-        # Collect data for combined CSV
-        audio_filename = f"{filename}.wav"
-        for record in diarization_records:
-            all_diarization_data.append({
-                'AudioFileName': audio_filename,
-                'Speaker': record['Speaker'],
-                'StartTS': f"{record['StartTS']:.3f}",
-                'EndTS': f"{record['EndTS']:.3f}",
-                'Language': record['Language']
-            })
-        
-        # Count overlaps
-        num_overlaps = count_overlaps(diarization_records)
-        print(f"Sample {i+1} created: {num_speakers} speakers, {len(diarization_records)} segments, {num_overlaps} overlaps")
-    
-    # Save combined CSV file in parent directory
-    if all_diarization_data:
-        combined_csv_path = os.path.join(OUTPUT_DIR, "all_samples_combined.csv")
-        df_combined = pd.DataFrame(all_diarization_data)
-        df_combined.to_csv(combined_csv_path, index=True, index_label='')
-        print(f"\n✅ Combined CSV saved: {combined_csv_path}")
-        print(f"   Total segments across all samples: {len(all_diarization_data)}")
-    
-    # Report combined RTTM in parent directory
-    if os.path.exists(combined_rttm_path):
-        with open(combined_rttm_path, 'r') as f:
-            rttm_lines = len(f.readlines())
-        print(f"\n✅ Combined RTTM saved: {combined_rttm_path}")
-        print(f"   Total RTTM entries: {rttm_lines}")
-        print(f"   Ready for pyannote.audio training!")
-    
-    print(f"\n✅ Dataset preparation complete! Output saved to '{OUTPUT_DIR}' folder")
-    print(f"\n📁 Output Structure:")
-    print(f"   {OUTPUT_DIR}/")
-    print(f"   ├── all_samples_combined.csv (all labels in CSV)")
-    print(f"   ├── all_samples_combined.rttm (all labels in RTTM for pyannote)")
-    print(f"   ├── audio/ ({NUM_SAMPLES_TO_GENERATE} .wav files)")
-    print(f"   ├── rttm/ ({NUM_SAMPLES_TO_GENERATE} .rttm files)")
-    print(f"   └── csv/ ({NUM_SAMPLES_TO_GENERATE} .csv files)")
+    # Generate dataset
+    generate_dataset(
+        total_hours=args.total_hours,
+        output_dir=args.output_dir,
+        source_dirs=source_dirs,
+        noise_dir=args.noise_dir
+    )
 
 if __name__ == "__main__":
     main()
